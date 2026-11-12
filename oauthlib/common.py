@@ -1,0 +1,555 @@
+"""
+oauthlib.common
+~~~~~~~~~~~~~~
+
+This module provides data structures and utilities common
+to all implementations of OAuth.
+"""
+import collections
+import datetime
+import hashlib
+import hmac
+import logging
+import os
+import re
+import secrets
+import time
+import urllib.parse as urlparse
+from urllib.parse import (
+    quote as _quote, unquote as _unquote, urlencode as _urlencode,
+)
+
+from . import get_debug
+
+try:
+    from secrets import SystemRandom, randbits
+except ImportError:
+    from random import SystemRandom, getrandbits as randbits
+
+UNICODE_ASCII_CHARACTER_SET = ('abcdefghijklmnopqrstuvwxyz'
+                               'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+                               '0123456789')
+
+CLIENT_ID_CHARACTER_SET = (r' !"#$%&\'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMN'
+                           'OPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}')
+
+SANITIZE_KEY_PATTERN = re.compile(r'password|token', re.IGNORECASE)
+INVALID_HEX_PATTERN = re.compile(r'%[^0-9A-Fa-f]|%[0-9A-Fa-f][^0-9A-Fa-f]')
+
+always_safe = ('ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+               'abcdefghijklmnopqrstuvwxyz'
+               '0123456789_.-')
+
+log = logging.getLogger('oauthlib')
+
+LOG_SAFE_PREFIX_LENGTH = 4
+LOG_SAFE_HASH_LENGTH = 12
+
+LOG_SAFE_KEY = os.environ.get('OAUTHLIB_LOG_SAFE_KEY') or secrets.token_bytes(32)
+
+
+def set_log_safe_key(key):
+    """Set the key used by log_safe to fingerprint secrets in log output.
+
+    Set a stable key to make log_safe fingerprints reproducible across
+    processes and restarts, so log lines can be correlated against known
+    values. By default a random per-process key is used, which prevents
+    offline brute-force of low-entropy values from log output but only
+    allows correlation within a single process run.
+
+    Passing None resets the key to a fresh random per-process key.
+    """
+    global LOG_SAFE_KEY  # noqa: PLW0603
+    LOG_SAFE_KEY = key if key is not None else secrets.token_bytes(32)
+
+
+def _get_log_safe_key():
+    """Return the current log_safe key, encoded to bytes for hmac.new()."""
+    key = LOG_SAFE_KEY
+    if isinstance(key, str):
+        key = key.encode('utf-8')
+    return key
+
+
+def log_safe(value):
+    """Return a non-reversible representation of a secret suitable for logging.
+
+    The returned string contains a short prefix (for correlation with other
+    log lines or known values) plus a truncated HMAC-SHA256 of the value
+    (for exact matching of the same secret across log lines), never exposing
+    enough of the secret to be replayed. The HMAC is keyed with LOG_SAFE_KEY:
+    with a stable key the fingerprints are reproducible, with the default
+    random per-process key they are not computable outside the process.
+
+    Mappings are returned as a new dict with every value passed through
+    ``log_safe``, so structured details (e.g. token field names) remain
+    visible while their values are sanitized.
+    """
+    if isinstance(value, dict):
+        return {k: log_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [log_safe(v) for v in value]
+    if value is None:
+        return None
+    value = str(value)
+    digest = hmac.new(_get_log_safe_key(), value.encode('utf-8'), hashlib.sha256).hexdigest()[:LOG_SAFE_HASH_LENGTH]
+    prefix = value[:LOG_SAFE_PREFIX_LENGTH] if len(value) > LOG_SAFE_PREFIX_LENGTH else value
+    return '%s..%s' % (prefix, digest)
+
+
+# 'safe' must be bytes (Python 2.6 requires bytes, other versions allow either)
+def quote(s, safe=b'/'):
+    s = s.encode('utf-8') if isinstance(s, str) else s
+    s = _quote(s, safe)
+    # PY3 always returns unicode.  PY2 may return either, depending on whether
+    # it had to modify the string.
+    if isinstance(s, bytes):
+        s = s.decode('utf-8')
+    return s
+
+
+def unquote(s):
+    s = _unquote(s)
+    # PY3 always returns unicode.  PY2 seems to always return what you give it,
+    # which differs from quote's behavior.  Just to be safe, make sure it is
+    # unicode before we return.
+    if isinstance(s, bytes):
+        s = s.decode('utf-8')
+    return s
+
+
+def urlencode(params):
+    utf8_params = encode_params_utf8(params)
+    urlencoded = _urlencode(utf8_params)
+    if isinstance(urlencoded, str):
+        return urlencoded
+    else:
+        return urlencoded.decode("utf-8")
+
+
+def encode_params_utf8(params):
+    """Ensures that all parameters in a list of 2-element tuples are encoded to
+    bytestrings using UTF-8
+    """
+    encoded = []
+    for k, v in params:
+        encoded.append((
+            k.encode('utf-8') if isinstance(k, str) else k,
+            v.encode('utf-8') if isinstance(v, str) else v))
+    return encoded
+
+
+def decode_params_utf8(params):
+    """Ensures that all parameters in a list of 2-element tuples are decoded to
+    unicode using UTF-8.
+    """
+    decoded = []
+    for k, v in params:
+        decoded.append((
+            k.decode('utf-8') if isinstance(k, bytes) else k,
+            v.decode('utf-8') if isinstance(v, bytes) else v))
+    return decoded
+
+
+urlencoded = set(always_safe) | set('=&;:%+~,*@!()/?\'$')
+
+
+def urldecode(query):
+    """Decode a query string in x-www-form-urlencoded format into a sequence
+    of two-element tuples.
+
+    Unlike urlparse.parse_qsl(..., strict_parsing=True) urldecode will enforce
+    correct formatting of the query string by validation. If validation fails
+    a ValueError will be raised. urllib.parse_qsl will only raise errors if
+    any of name-value pairs omits the equals sign.
+    """
+    # Check if query contains invalid characters
+    if query and not set(query) <= urlencoded:
+        error = ("Error trying to decode a non urlencoded string. "
+                 "Found invalid characters: %s "
+                 "in the string: '%s'. "
+                 "Please ensure the request/response body is "
+                 "x-www-form-urlencoded.")
+        raise ValueError(error % (set(query) - urlencoded, query))
+
+    # Check for correctly hex encoded values using a regular expression
+    # All encoded values begin with % followed by two hex characters
+    # correct = %00, %A0, %0A, %FF
+    # invalid = %G0, %5H, %PO
+    if INVALID_HEX_PATTERN.search(query):
+        raise ValueError('Invalid hex encoding in query string.')
+
+    # We want to allow queries such as "c2" whereas urlparse.parse_qsl
+    # with the strict_parsing flag will not.
+    params = urlparse.parse_qsl(query, keep_blank_values=True)
+
+    # unicode all the things
+    return decode_params_utf8(params)
+
+
+def extract_params(raw):
+    """Extract parameters and return them as a list of 2-tuples.
+
+    Will successfully extract parameters from urlencoded query strings,
+    dicts, or lists of 2-tuples. Empty strings/dicts/lists will return an
+    empty list of parameters. Any other input will result in a return
+    value of None.
+    """
+    if isinstance(raw, (bytes, str)):
+        try:
+            params = urldecode(raw)
+        except ValueError:
+            params = None
+    elif hasattr(raw, '__iter__'):
+        try:
+            dict(raw)
+        except ValueError:
+            params = None
+        except TypeError:
+            params = None
+        else:
+            params = list(raw.items() if isinstance(raw, dict) else raw)
+            params = decode_params_utf8(params)
+    else:
+        params = None
+
+    return params
+
+
+def generate_nonce():
+    """Generate pseudorandom nonce that is unlikely to repeat.
+
+    Per `section 3.3`_ of the OAuth 1 RFC 5849 spec.
+    Per `section 3.2.1`_ of the MAC Access Authentication spec.
+
+    RFC 5849 section 3.3 requires the nonce to be unique "across all requests
+    with the same timestamp, client credentials, and token combinations". The
+    ``oauth_timestamp`` parameter is sent separately, so embedding the epoch
+    time in the nonce does nothing to distinguish requests that share a
+    timestamp: within a given second the collision resistance comes entirely
+    from the random component. This uses 96 bits drawn from the system CSPRNG
+    (up from the previous 64 bits appended to the timestamp), which keeps the
+    birthday-bound collision probability negligible while the decimal encoding
+    stays within the default nonce length limits.
+
+    .. _`section 3.2.1`: https://tools.ietf.org/html/draft-ietf-oauth-v2-http-mac-01#section-3.2.1
+    .. _`section 3.3`: https://tools.ietf.org/html/rfc5849#section-3.3
+    """
+    return str(randbits(96))
+
+
+def generate_timestamp():
+    """Get seconds since epoch (UTC).
+
+    Per `section 3.3`_ of the OAuth 1 RFC 5849 spec.
+    Per `section 3.2.1`_ of the MAC Access Authentication spec.
+
+    .. _`section 3.2.1`: https://tools.ietf.org/html/draft-ietf-oauth-v2-http-mac-01#section-3.2.1
+    .. _`section 3.3`: https://tools.ietf.org/html/rfc5849#section-3.3
+    """
+    return str(int(time.time()))
+
+
+def generate_token(length=30, chars=UNICODE_ASCII_CHARACTER_SET):
+    """Generates a non-guessable OAuth token
+
+    OAuth (1 and 2) does not specify the format of tokens except that they
+    should be strings of random characters. Tokens should not be guessable
+    and entropy when generating the random characters is important. Which is
+    why SystemRandom is used instead of the default random.choice method.
+    """
+    rand = SystemRandom()
+    return ''.join(rand.choice(chars) for x in range(length))
+
+
+def generate_signed_token(private_pem, request):
+    import jwt  # noqa: PLC0415
+
+    now = datetime.datetime.utcnow()
+
+    claims = {
+        'scope': request.scope,
+        'exp': now + datetime.timedelta(seconds=request.expires_in)
+    }
+
+    claims.update(request.claims)
+
+    token = jwt.encode(claims, private_pem, 'RS256')
+    token = to_unicode(token, "UTF-8")
+
+    return token
+
+
+def verify_signed_token(public_pem, token):
+    import jwt  # noqa: PLC0415
+
+    return jwt.decode(token, public_pem, algorithms=['RS256'])
+
+
+def generate_client_id(length=30, chars=CLIENT_ID_CHARACTER_SET):
+    """Generates an OAuth client_id
+
+    OAuth 2 specify the format of client_id in
+    https://tools.ietf.org/html/rfc6749#appendix-A.
+    """
+    return generate_token(length, chars)
+
+
+def add_params_to_qs(query, params):
+    """Extend a query with a list of two-tuples."""
+    if isinstance(params, dict):
+        params = params.items()
+    queryparams = urlparse.parse_qsl(query, keep_blank_values=True)
+    queryparams.extend(params)
+    return urlencode(queryparams)
+
+
+def add_params_to_uri(uri, params, fragment=False):
+    """Add a list of two-tuples to the uri query components."""
+    sch, net, path, par, query, fra = urlparse.urlparse(uri)
+    if fragment:
+        fra = add_params_to_qs(fra, params)
+    else:
+        query = add_params_to_qs(query, params)
+    return urlparse.urlunparse((sch, net, path, par, query, fra))
+
+
+def safe_string_equals(a, b):
+    """ Near-constant time string comparison.
+
+    Used in order to avoid timing attacks on sensitive information such
+    as secret keys during request verification (`rootLabs`_).
+
+    Both operands are digested with SHA-256 before being compared with
+    :func:`hmac.compare_digest`. Comparing fixed-length digests removes
+    any dependency of the comparison's timing (and control flow) on the
+    length or content of either operand, so callers do not leak the
+    length of server-side secrets such as OAuth1 PLAINTEXT signatures.
+
+    .. _`rootLabs`: http://rdist.root.org/2010/01/07/timing-independent-array-comparison/
+
+    """
+    if isinstance(a, str):
+        a = a.encode('utf-8')
+    if isinstance(b, str):
+        b = b.encode('utf-8')
+    a_digest = hashlib.sha256(a).digest()
+    b_digest = hashlib.sha256(b).digest()
+    return hmac.compare_digest(a_digest, b_digest)
+
+
+def check_http_header_value(name, value):
+    """Validate that a value is safe to embed in an HTTP header field value.
+
+    Prevents header injection by rejecting characters that allow the value
+    to break out of its header field, per RFC 9110 section 5.5:
+
+    - CR and LF characters, which enable header splitting/injection;
+    - other control characters (CTLs, including NUL), which may corrupt
+      or terminate parsing of the header by downstream intermediaries;
+    - double quotes, which allow a quoted-string parameter in a header
+      value (such as the MAC Authorization header) to break out and
+      inject arbitrary parameters;
+    - non-ASCII characters, which are mangled inconsistently by proxies
+      and gateways and may be re-interpreted as control characters.
+
+    :param name: Name of the parameter, used in error messages.
+    :param value: Candidate header value. ``None`` is allowed and ignored.
+    :raises ValueError: if the value contains unsafe characters.
+    """
+    if value is None:
+        return
+    if not isinstance(value, str):
+        raise ValueError('%s must be a string' % name)
+    for char in value:
+        if char in '\r\n':
+            raise ValueError('%s must not contain CR or LF characters' % name)
+        if ord(char) < 0x20 or ord(char) == 0x7f:
+            raise ValueError('%s must not contain control characters' % name)
+        if char == '"':
+            raise ValueError('%s must not contain double quotes' % name)
+        if ord(char) > 0x7e:
+            raise ValueError('%s must contain ASCII characters only' % name)
+
+
+def to_unicode(data, encoding='UTF-8'):
+    """Convert a number of different types of objects to unicode."""
+    if isinstance(data, str):
+        return data
+
+    if isinstance(data, bytes):
+        return str(data, encoding=encoding)
+
+    if hasattr(data, '__iter__'):
+        try:
+            dict(data)
+        except TypeError:
+            pass
+        except ValueError:
+            # Assume it's a one dimensional data structure
+            return (to_unicode(i, encoding) for i in data)
+        else:
+            # We support 2.6 which lacks dict comprehensions
+            if hasattr(data, 'items'):
+                data = data.items()
+            return {to_unicode(k, encoding): to_unicode(v, encoding) for k, v in data}
+
+    return data
+
+
+def _sanitize_body(body):
+    """Redact values of parameters whose name mentions password or token.
+
+    Linear-time replacement for the former SANITIZE_PATTERN regex, whose
+    backtracking made ``repr(Request)`` pathological on adversarial bodies
+    when debug mode is enabled.
+    """
+    parts = re.split(r'([&;])', body)
+    for i in range(0, len(parts), 2):
+        name, sep, value = parts[i].partition('=')
+        if sep and value and SANITIZE_KEY_PATTERN.search(name):
+            parts[i] = name + '=<SANITIZED>'
+    return ''.join(parts)
+
+
+class CaseInsensitiveDict(dict):
+
+    """Basic case insensitive dict with strings only keys."""
+
+    proxy = {}
+
+    def __init__(self, data):
+        self.proxy = {k.lower(): k for k in data}
+        for k in data:
+            self[k] = data[k]
+
+    def __contains__(self, k):
+        return k.lower() in self.proxy
+
+    def __delitem__(self, k):
+        key = self.proxy[k.lower()]
+        super().__delitem__(key)
+        del self.proxy[k.lower()]
+
+    def __getitem__(self, k):
+        key = self.proxy[k.lower()]
+        return super().__getitem__(key)
+
+    def get(self, k, default=None):
+        return self[k] if k in self else default  # noqa: SIM401
+
+    def __setitem__(self, k, v):
+        super().__setitem__(k, v)
+        self.proxy[k.lower()] = k
+
+    def update(self, *args, **kwargs):
+        super().update(*args, **kwargs)
+        for k in dict(*args, **kwargs):
+            self.proxy[k.lower()] = k
+
+
+class Request:
+
+    """A malleable representation of a signable HTTP request.
+
+    Body argument may contain any data, but parameters will only be decoded if
+    they are one of:
+
+    * urlencoded query string
+    * dict
+    * list of 2-tuples
+
+    Anything else will be treated as raw body data to be passed through
+    unmolested.
+    """
+
+    def __init__(self, uri, http_method='GET', body=None, headers=None,
+                 encoding='utf-8'):
+        # Convert to unicode using encoding if given, else assume unicode
+        def encode(x):
+            return to_unicode(x, encoding) if encoding else x
+
+        self.uri = encode(uri)
+        self.http_method = encode(http_method)
+        self.headers = CaseInsensitiveDict(encode(headers or {}))
+        self.body = encode(body)
+        self.decoded_body = extract_params(self.body)
+        self.oauth_params = []
+        self.validator_log = {}
+
+        self._params = {
+            "access_token": None,
+            "client": None,
+            "client_id": None,
+            "client_secret": None,
+            "code": None,
+            "code_challenge": None,
+            "code_challenge_method": None,
+            "code_verifier": None,
+            "device_code": None,
+            "extra_credentials": None,
+            "grant_type": None,
+            "redirect_uri": None,
+            "refresh_token": None,
+            "request_token": None,
+            "resource": None,
+            "response_type": None,
+            "scope": None,
+            "scopes": None,
+            "state": None,
+            "token": None,
+            "user": None,
+            "token_type_hint": None,
+
+            # OpenID Connect
+            "response_mode": None,
+            "nonce": None,
+            "display": None,
+            "prompt": None,
+            "claims": None,
+            "max_age": None,
+            "ui_locales": None,
+            "id_token_hint": None,
+            "login_hint": None,
+            "acr_values": None
+        }
+        self._params.update(dict(urldecode(self.uri_query)))
+        self._params.update(dict(self.decoded_body or []))
+
+    def __getattr__(self, name):
+        if name in self._params:
+            return self._params[name]
+        else:
+            raise AttributeError(name)
+
+    def __repr__(self):
+        if not get_debug():
+            return "<oauthlib.Request SANITIZED>"
+        body = self.body
+        headers = self.headers.copy()
+        if body:
+            body = _sanitize_body(str(body))
+        if 'Authorization' in headers:
+            headers['Authorization'] = '<SANITIZED>'
+        return '<oauthlib.Request url="{}", http_method="{}", headers="{}", body="{}">'.format(
+            self.uri, self.http_method, headers, body)
+
+    @property
+    def uri_query(self):
+        return urlparse.urlparse(self.uri).query
+
+    @property
+    def uri_query_params(self):
+        if not self.uri_query:
+            return []
+        return urlparse.parse_qsl(self.uri_query, keep_blank_values=True,
+                                  strict_parsing=True)
+
+    @property
+    def duplicate_params(self):
+        seen_keys = collections.defaultdict(int)
+        all_keys = (p[0]
+                    for p in (self.decoded_body or []) + self.uri_query_params)
+        for k in all_keys:
+            seen_keys[k] += 1
+        return [k for k, c in seen_keys.items() if c > 1]
