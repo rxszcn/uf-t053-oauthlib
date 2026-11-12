@@ -4,6 +4,15 @@ Changelog
 Unreleased:
 ------------------
 OAuth2.0 Provider:
+* ``RefreshTokenGrant.validate_token_request`` now rejects a duplicated
+  ``grant_type``, ``refresh_token`` or ``scope`` parameter with
+  ``invalid_request`` (HTTP 400), matching the other token endpoint grant
+  types. Previously the refresh flow silently used the last occurrence of a
+  duplicated parameter, a parameter pollution gap (RFC 6749 section 3.2
+  requires parameters not to be included more than once). The check runs
+  before client authentication, so both the Authorization header and the
+  request body client authentication forms are covered, and single-value
+  refresh requests are unaffected.
 * **Breaking**: #988: PKCE parameters are now validated against RFC 7636
   syntax. ``code_verifier`` must be 43-128 unreserved ASCII characters
   (``[A-Za-z0-9-._~]``) at the token endpoint (rejected with ``invalid_grant``)

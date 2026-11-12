@@ -172,6 +172,18 @@ class ErrorResponseTest(TestCase):
                     body=body)
             self.assertEqual('invalid_request', json.loads(body)['error'])
 
+        # Refresh token grant
+        invalid_bodies = [
+            # duplicate params
+            'grant_type=refresh_token&grant_type=refresh_token&refresh_token=foo',
+            'grant_type=refresh_token&refresh_token=foo&refresh_token=bar',
+            'grant_type=refresh_token&refresh_token=foo&scope=bar&scope=baz',
+        ]
+        for body in invalid_bodies:
+            _, body, _ = self.web.create_token_response(token_uri,
+                    body=body)
+            self.assertEqual('invalid_request', json.loads(body)['error'])
+
     def test_invalid_request_duplicate_params(self):
         self.validator.get_default_redirect_uri.return_value = 'https://i.b/cb'
         uri = 'https://i.b/auth?client_id=foo&client_id=bar&response_type={0}'

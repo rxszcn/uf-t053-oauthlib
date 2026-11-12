@@ -162,6 +162,49 @@ class RefreshTokenGrantTest(TestCase):
         self.assertRaises(errors.UnsupportedGrantTypeError,
                           self.auth.validate_token_request, self.request)
 
+    def test_invalid_request_duplicates(self):
+        for param in ('grant_type', 'refresh_token', 'scope'):
+            self.mock_validator.reset_mock()
+            # A duplicated grant_type keeps a legal value so the duplicate
+            # parameter check, rather than the grant type check, is reached.
+            value = 'refresh_token' if param == 'grant_type' else 'one'
+            request = Request(
+                'http://a.b/path',
+                body='grant_type=refresh_token&refresh_token=abc'
+                     '&%s=%s&%s=%s' % (param, value, param, value))
+            with self.subTest(param=param):
+                self.assertRaises(errors.InvalidRequestError,
+                                  self.auth.validate_token_request, request)
+                # Duplicate parameter checks run before client authentication,
+                # matching the other token endpoint grant types.
+                self.mock_validator.client_authentication_required.\
+                    assert_not_called()
+
+    def test_duplicate_params_error_response(self):
+        """The duplicate parameter error uses the same error code, type and
+        response shape as the other grant types."""
+        bearer = BearerToken(self.mock_validator)
+        for param in ('grant_type', 'refresh_token', 'scope'):
+            self.mock_validator.reset_mock()
+            value = 'refresh_token' if param == 'grant_type' else 'one'
+            body = (
+                'grant_type=refresh_token&refresh_token=abc'
+                '&%s=%s&%s=%s' % (param, value, param, value)
+            )
+            request = Request('http://a.b/path', body=body)
+            with self.subTest(param=param):
+                headers, resp_body, status_code = \
+                    self.auth.create_token_response(request, bearer)
+                payload = json.loads(resp_body)
+                self.assertEqual(status_code, 400)
+                self.assertEqual(payload['error'], 'invalid_request')
+                self.assertEqual(payload['error_description'],
+                                 'Duplicate %s parameter.' % param)
+                self.assertEqual(headers['Content-Type'], 'application/json')
+                self.assertEqual(headers['Cache-Control'], 'no-store')
+                self.assertEqual(headers['Pragma'], 'no-cache')
+                self.mock_validator.save_token.assert_not_called()
+
     def test_authenticate_client_id(self):
         self.mock_validator.client_authentication_required.return_value = False
         self.request.refresh_token = mock.MagicMock()
